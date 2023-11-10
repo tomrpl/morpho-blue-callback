@@ -2,69 +2,143 @@
 pragma solidity ^0.8.0;
 
 import "@morpho-blue-test/BaseTest.sol";
-import {IMorphoSupplyCollateralCallback} from "@morpho-blue/interfaces/IMorphoCallbacks.sol";
+import {IMorphoSupplyCollateralCallback, IMorphoRepayCallback} from "@morpho-blue/interfaces/IMorphoCallbacks.sol";
+import {SwapMock} from "@snippets/blue/mocks/SwapMock.sol";
 
-contract CallbacksIntegrationTest is BaseTest, IMorphoSupplyCollateralCallback {
+contract CallbacksIntegrationTest is BaseTest, IMorphoSupplyCollateralCallback, IMorphoRepayCallback {
     using MathLib for uint256;
     using MorphoLib for IMorpho;
     using MorphoBalancesLib for IMorpho;
     using MarketParamsLib for MarketParams;
 
+    SwapMock internal swapMock;
+
+    function setUp() public virtual override {
+        super.setUp();
+        swapMock = new SwapMock(address(collateralToken), address(loanToken), address(oracle));
+    }
+
     // IMPLEMENTATION
+
     function onMorphoSupplyCollateral(uint256 amount, bytes memory data) external {
         require(msg.sender == address(morpho));
         bytes4 selector;
         (selector, data) = abi.decode(data, (bytes4, bytes));
         if (selector == this.testLeverageCallback.selector) {
             uint256 toBorrow = abi.decode(data, (uint256));
-
-            // borrow the amount of the loan that the leveragors gave
             (uint256 amountBis,) = morpho.borrow(marketParams, toBorrow, 0, address(this), address(this));
-
-            // CHEATCODE:
-            // for the sake of the implementation, the following logic has been used.
-            // In real use case, one would either swap the loan asset to the collat asset, or unwrap , stake and wrap
-            // for a leverage of the type:
-            // weth/wstETH
-            // assume 1 loanTOken = 1 collatToken in value
-            collateralToken.setBalance(address(this), amount); // be sure that amount is greater than the amountBis
-                // value
-            require(amount >= amountBis);
             collateralToken.approve(address(this), amount);
-            // something as the following function could be defined
-            // _wethToWSTETH(amountBis);
+
+            // Logic to Implement. Following example is a swap, could be a 'unwrap + stake + wrap staked' for
+            // wETH(wstETH) Market
+            swapMock.swapLoanToCollat(amountBis);
+        }
+    }
+
+    function onMorphoRepay(uint256 amount, bytes memory data) external {
+        require(msg.sender == address(morpho));
+        bytes4 selector;
+        (selector, data) = abi.decode(data, (bytes4, bytes));
+        if (selector == this.testLeverageCallback.selector) {
+            uint256 toWithdraw = abi.decode(data, (uint256));
+            morpho.withdrawCollateral(marketParams, toWithdraw, address(this), address(this));
+            loanToken.approve(address(morpho), amount);
+            swapMock.swapCollatToLoan(toWithdraw);
         }
     }
 
     // TEST
 
-    function testLeverageCallback(uint256 loanAmount) public {
-        loanAmount = bound(loanAmount, MIN_TEST_AMOUNT, MAX_TEST_AMOUNT);
-        uint256 collateralAmount;
-        (collateralAmount, loanAmount,) = _boundHealthyPosition(0, loanAmount, oracle.price());
+    function testLeverageCallback(uint256 collateralInitAmount) public {
+        // INITIALISATION
+
+        uint256 leverageFactor = 4; // nb to set
+        uint256 loanLeverageFactor = 3; // max here would be 3.2 = 0.8 * leverageFactor
+
+        collateralInitAmount = bound(collateralInitAmount, MIN_TEST_AMOUNT, MAX_TEST_AMOUNT / leverageFactor);
+
+        collateralToken.setBalance(address(this), collateralInitAmount);
+
+        uint256 collateralAmount = collateralInitAmount * leverageFactor; // this is targeted leverage
+        // (collateralAmount, loanAmount,) = _boundHealthyPosition(0, loanAmount, oracle.price());
 
         oracle.setPrice(ORACLE_PRICE_SCALE);
 
-        // supplying 2 times the loanAmount such that there is liquidity into the market
+        // supplying enough liquidity in the market
         vm.startPrank(SUPPLIER);
-        loanToken.setBalance(address(SUPPLIER), 2 * loanAmount);
-        morpho.supply(marketParams, 2 * loanAmount, 0, address(SUPPLIER), hex"");
+        loanToken.setBalance(address(SUPPLIER), collateralAmount);
+        morpho.supply(marketParams, collateralAmount, 0, address(SUPPLIER), hex"");
         vm.stopPrank();
+
+        // approve the swap contract
+        loanToken.approve(address(swapMock), type(uint256).max);
+
+        // Compute LoanAmount
+        uint256 loanAmount = collateralInitAmount * loanLeverageFactor;
 
         // let's call the callback function
         morpho.supplyCollateral(
             marketParams,
-            collateralAmount, // the total collat that will be transfered from the user to the Blue market during the
-                // callback mechanism
+            collateralAmount,
             address(this),
-            // the loan amountcorresponds to what
-            // will be borrowed from the market
             abi.encode(this.testLeverageCallback.selector, abi.encode(loanAmount))
         );
 
-        assertGt(morpho.expectedSupplyAssets(marketParams, address(this)), 0, "no borrow"); // verify that the
-            // position has
-            // a borrow
-            // assertEq(morpho.collateral(marketParams.id(), address(this)), collateralAmount, "no collateral");
+        assertGt(morpho.borrowShares(marketParams.id(), address(this)), 0, "no borrow");
+        assertEq(morpho.collateral(marketParams.id(), address(this)), collateralAmount, "no collateral");
+        assertEq(morpho.expectedBorrowAssets(marketParams, address(this)), loanAmount, "no collateral");
+    }
+
+    function testLeverageThenDeleverageCallback(uint256 collateralInitAmount) public {
+        /// ///  PURE COPY OF PREVIOUS TEST, DO NOT TOUCH
+        // INITIALISATION
+
+        uint256 leverageFactor = 4; // nb to set
+        uint256 loanLeverageFactor = 3; // max here would be 3.2 = 0.8 * leverageFactor
+
+        collateralInitAmount = bound(collateralInitAmount, MIN_TEST_AMOUNT, MAX_TEST_AMOUNT / leverageFactor);
+
+        collateralToken.setBalance(address(this), collateralInitAmount);
+
+        uint256 collateralAmount = collateralInitAmount * leverageFactor;
+        oracle.setPrice(ORACLE_PRICE_SCALE);
+
+        // supplying enough liquidity in the market
+        vm.startPrank(SUPPLIER);
+        loanToken.setBalance(address(SUPPLIER), collateralAmount);
+        morpho.supply(marketParams, collateralAmount, 0, address(SUPPLIER), hex"");
+        vm.stopPrank();
+
+        // approve the swap contract
+        loanToken.approve(address(swapMock), type(uint256).max);
+
+        // Compute LoanAmount
+        uint256 loanAmount = collateralInitAmount * loanLeverageFactor;
+
+        // let's call the callback function
+        morpho.supplyCollateral(
+            marketParams,
+            collateralAmount,
+            address(this),
+            abi.encode(this.testLeverageCallback.selector, abi.encode(loanAmount))
+        );
+
+        assertGt(morpho.borrowShares(marketParams.id(), address(this)), 0, "no borrow");
+        assertEq(morpho.collateral(marketParams.id(), address(this)), collateralAmount, "no collateral");
+        assertEq(morpho.expectedBorrowAssets(marketParams, address(this)), loanAmount, "no collateral");
+
+        /// END OF PURE COPY OF PREVIOUS TEST
+
+        collateralToken.approve(address(swapMock), type(uint256).max);
+        (uint256 amountRepayed,) = morpho.repay(
+            marketParams,
+            loanAmount,
+            0,
+            address(this),
+            abi.encode(this.testLeverageCallback.selector, abi.encode(collateralAmount))
+        );
+
+        assertEq(morpho.borrowShares(marketParams.id(), address(this)), 0, "no borrow");
+        assertEq(amountRepayed, loanAmount, "no repaid");
     }
 }

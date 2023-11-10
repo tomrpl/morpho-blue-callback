@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity ^0.8.0;
 
 import {ORACLE_PRICE_SCALE} from "@morpho-blue/libraries/ConstantsLib.sol";
@@ -15,7 +16,7 @@ contract SwapMock {
 
     address public immutable oracle;
 
-    constructor(address collateralAddress, ERC20Mock loanAddress, address oracleAddress) {
+    constructor(address collateralAddress, address loanAddress, address oracleAddress) {
         collateralToken = ERC20Mock(collateralAddress);
         loanToken = ERC20Mock(loanAddress);
 
